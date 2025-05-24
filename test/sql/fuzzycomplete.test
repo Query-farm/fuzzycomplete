@@ -20,4 +20,4 @@ SELECT
 query I
 SELECT suggestion from sql_auto_complete('SELECT * from tables') limit 1
 ----
-duckdb_tables
+"system".main.duckdb_tables
