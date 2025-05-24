@@ -12,7 +12,7 @@ It may not yet be the best solution for SQL completion, but it has proven to be 
 
 ## Installation
 
-**`fuzzycomplete` will hopefully soon be a [DuckDB Community Extension](https://github.com/duckdb/community-extensions).**
+**`fuzzycomplete` is a [DuckDB Community Extension](https://github.com/duckdb/community-extensions).**
 
 You can now use this by using this SQL:
 
