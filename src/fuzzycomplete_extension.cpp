@@ -13,7 +13,6 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/main/database_manager.hpp"
-#include "duckdb/main/extension_util.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/parser/parser.hpp"
 
@@ -599,20 +598,22 @@ namespace duckdb
 		output.SetCardinality(count);
 	}
 
-	static void LoadInternal(DatabaseInstance &db)
+	static void LoadInternal(ExtensionLoader &loader)
 	{
 		// For now just only load if the autocomplete extension isn't loaded.
 		// there are plans to improve this in the future.
-		if (!db.ExtensionIsLoaded("autocomplete")) {
+		auto &db = loader.GetDatabaseInstance();
+		if (!db.ExtensionIsLoaded("autocomplete"))
+		{
 			TableFunction auto_complete_fun("sql_auto_complete", {LogicalType::VARCHAR}, SQLFuzzyCompleteFunction,
 																			SQLFuzzyCompleteBind, SQLFuzzyCompleteInit);
-			ExtensionUtil::RegisterFunction(db, auto_complete_fun);
+			loader.RegisterFunction(auto_complete_fun);
 		}
 	}
 
-	void FuzzycompleteExtension::Load(DuckDB &db)
+	void FuzzycompleteExtension::Load(ExtensionLoader &loader)
 	{
-		LoadInternal(*db.instance);
+		LoadInternal(loader);
 	}
 
 	std::string FuzzycompleteExtension::Name()
@@ -620,30 +621,12 @@ namespace duckdb
 		return "fuzzycomplete";
 	}
 
-	std::string FuzzycompleteExtension::Version() const
-	{
-#ifdef EXT_VERSION_FuzzyComplete
-		return EXT_VERSION_FuzzyComplete;
-#else
-		return "";
-#endif
-	}
-
 } // namespace duckdb
 extern "C"
 {
 
-	DUCKDB_EXTENSION_API void fuzzycomplete_init(duckdb::DatabaseInstance &db)
+	DUCKDB_CPP_EXTENSION_ENTRY(fuzzycomplete, loader)
 	{
-		LoadInternal(db);
-	}
-
-	DUCKDB_EXTENSION_API const char *fuzzycomplete_version()
-	{
-		return duckdb::DuckDB::LibraryVersion();
+		duckdb::LoadInternal(loader);
 	}
 }
-
-#ifndef DUCKDB_EXTENSION_MAIN
-#error DUCKDB_EXTENSION_MAIN not defined
-#endif
