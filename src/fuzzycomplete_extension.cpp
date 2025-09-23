@@ -18,6 +18,7 @@
 
 // Include the declarations of things from Rust.
 #include "rust.h"
+#include "query_farm_telemetry.hpp"
 
 namespace duckdb
 {
@@ -609,6 +610,8 @@ namespace duckdb
 																			SQLFuzzyCompleteBind, SQLFuzzyCompleteInit);
 			loader.RegisterFunction(auto_complete_fun);
 		}
+
+		QueryFarmSendTelemetry(loader, db.shared_from_this(), "fuzzycomplete", "2025092301");
 	}
 
 	void FuzzycompleteExtension::Load(ExtensionLoader &loader)
