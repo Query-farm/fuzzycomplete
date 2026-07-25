@@ -611,7 +611,7 @@ namespace duckdb
 			loader.RegisterFunction(auto_complete_fun);
 		}
 
-		QueryFarmSendTelemetry(loader, "fuzzycomplete", "2025092301");
+		QueryFarmSendTelemetry(loader, "fuzzycomplete", "2026072501");
 	}
 
 	void FuzzycompleteExtension::Load(ExtensionLoader &loader)
