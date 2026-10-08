@@ -1,0 +1,40 @@
+# name: test/sql/fuzzycomplete_preloaded_autocomplete.test
+# description: fuzzycomplete replaces the CLI's preloaded autocomplete provider
+# group: [fuzzycomplete]
+
+statement ok
+INSTALL autocomplete;
+
+statement ok
+LOAD autocomplete;
+
+# The stock edit-distance provider also returns non-subsequence candidates.
+query I
+SELECT count(*) > 1 FROM sql_auto_complete('SLCT');
+----
+true
+
+require fuzzycomplete
+
+# Assert matcher behavior, not just that LOAD succeeded or an OID changed.
+query II
+SELECT trim(suggestion), suggestion_start FROM sql_auto_complete('SLCT');
+----
+SELECT	0
+
+statement ok
+CREATE TABLE customer_order_history (order_id INTEGER);
+
+query II
+SELECT suggestion, suggestion_start FROM sql_auto_complete('SELECT * FROM cstmr_ord_hst');
+----
+customer_order_history	14
+
+# Re-loading the already loaded stock extension must leave fuzzycomplete active.
+statement ok
+LOAD autocomplete;
+
+query I
+SELECT trim(suggestion) FROM sql_auto_complete('SLCT');
+----
+SELECT
