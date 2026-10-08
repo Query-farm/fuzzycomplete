@@ -48,7 +48,8 @@ execute_process(
 )
 string(FIND "${RUST_TARGETS}" "wasm32-unknown-emscripten" WASM_TARGET_FOUND)
 
-if (NOT WASM_TARGET_FOUND EQUAL -1)
+# An installed WASM target must not override the target for a native build.
+if (NOT WASM_TARGET_FOUND EQUAL -1 AND (EMSCRIPTEN OR extracted_platform_prefix STREQUAL prefix_to_check))
   set(Rust_CARGO_TARGET "wasm32-unknown-emscripten")
 endif()
 
