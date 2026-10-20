@@ -716,7 +716,7 @@ namespace duckdb
 		info.on_conflict = OnCreateConflict::REPLACE_ON_CONFLICT;
 		loader.RegisterFunction(std::move(info));
 
-		QueryFarmSendTelemetry(loader, "fuzzycomplete", "2026072501");
+		QueryFarmSendTelemetry(loader, "fuzzycomplete", "2026102001");
 	}
 
 	void FuzzycompleteExtension::Load(ExtensionLoader &loader)
