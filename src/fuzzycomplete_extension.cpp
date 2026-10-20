@@ -193,9 +193,9 @@ namespace duckdb
 		vector<FuzzyCompleteCandidate> suggestions;
 		auto all_entries = GetAllTables(context, true);
 
-		auto default_database = DatabaseManager::GetDefaultDatabase(context);
+		auto default_database = DatabaseManager::GetDefaultDatabase(context).GetIdentifierName();
 
-		auto default_schema = ClientData::Get(context).catalog_search_path->GetDefault().schema;
+		auto default_schema = ClientData::Get(context).catalog_search_path->GetDefault().GetSchema().GetIdentifierName();
 
 		// So really we should add the other catalog names.
 
@@ -215,12 +215,12 @@ namespace duckdb
 			int32_t bonus = (entry.internal || entry.type == CatalogType::TABLE_FUNCTION_ENTRY) ? 0 : 1;
 
 			// We should use the full path based on the calling context of the user.
-			auto catalog_name = entry_ref.get().ParentCatalog().GetName();
-			auto schema_name = entry_ref.get().ParentSchema().name;
+			auto catalog_name = entry_ref.get().ParentCatalog().GetName().GetIdentifierName();
+			auto schema_name = entry_ref.get().ParentSchema().name.GetIdentifierName();
 
 			auto quoted_schema_name = KeywordHelper::WriteOptionallyQuoted(schema_name, '"', true);
 			auto quoted_catalog_name = KeywordHelper::WriteOptionallyQuoted(catalog_name, '"', true);
-			auto quoted_entry_name = KeywordHelper::WriteOptionallyQuoted(entry.name, '"', true);
+			auto quoted_entry_name = KeywordHelper::WriteOptionallyQuoted(entry.name.GetIdentifierName(), '"', true);
 
 			string prefix = quoted_catalog_name + "." + quoted_schema_name;
 
@@ -275,7 +275,7 @@ namespace duckdb
 				auto &table = entry.Cast<TableCatalogEntry>();
 				for (auto &col : table.GetColumns().Logical())
 				{
-					suggestions.emplace_back(col.GetName(), 1);
+					suggestions.emplace_back(col.GetName().GetIdentifierName(), 1);
 				}
 			}
 			else if (entry.type == CatalogType::VIEW_ENTRY)
@@ -283,16 +283,16 @@ namespace duckdb
 				auto &view = entry.Cast<ViewCatalogEntry>();
 				for (auto &col : view.aliases)
 				{
-					suggestions.emplace_back(col, 1);
+					suggestions.emplace_back(col.GetIdentifierName(), 1);
 				}
 			}
 			else
 			{
-				if (StringUtil::CharacterIsOperator(entry.name[0]))
+				if (entry.name.GetIdentifierName().empty() || StringUtil::CharacterIsOperator(entry.name.GetIdentifierName()[0]))
 				{
 					continue;
 				}
-				suggestions.emplace_back(entry.name);
+				suggestions.emplace_back(entry.name.GetIdentifierName());
 			};
 		}
 		return suggestions;
@@ -553,7 +553,7 @@ namespace duckdb
 	}
 
 	static duckdb::unique_ptr<FunctionData> SQLFuzzyCompleteBind(ClientContext &context, TableFunctionBindInput &input,
-																															 vector<LogicalType> &return_types, vector<string> &names)
+																															 vector<LogicalType> &return_types, vector<Identifier> &names)
 	{
 		if (input.inputs[0].IsNull())
 		{
@@ -585,19 +585,19 @@ namespace duckdb
 		// start returning values
 		// either fill up the chunk or return all the remaining columns
 		idx_t count = 0;
+		// suggestion, VARCHAR
+		auto &suggestion = output.data[0];
+		// suggestion_start, INTEGER
+		auto &suggestion_start = output.data[1];
 		while (data.offset < bind_data.suggestions.size() && count < STANDARD_VECTOR_SIZE)
 		{
 			auto &entry = bind_data.suggestions[data.offset++];
 
-			// suggestion, VARCHAR
-			output.SetValue(0, count, Value(entry));
-
-			// suggestion_start, INTEGER
-			output.SetValue(1, count, Value::INTEGER(bind_data.start_pos));
+			suggestion.Append(Value(entry));
+			suggestion_start.Append(Value::INTEGER(NumericCast<int32_t>(bind_data.start_pos)));
 
 			count++;
 		}
-		output.SetCardinality(count);
 	}
 
 	static void LoadInternal(ExtensionLoader &loader)
