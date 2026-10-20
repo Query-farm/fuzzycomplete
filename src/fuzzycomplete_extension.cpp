@@ -24,14 +24,36 @@
 namespace duckdb
 {
 
+	//! A single row of sql_auto_complete output, in the shape the DuckDB shell and the stock
+	//! autocomplete extension use: (suggestion, suggestion_start, suggestion_type, suggestion_score, extra_char)
+	struct FuzzyCompleteSuggestion
+	{
+		FuzzyCompleteSuggestion(string text_p, string type_p, uint64_t score_p, char extra_char_p)
+				: text(std::move(text_p)), type(std::move(type_p)), score(score_p), extra_char(extra_char_p)
+		{
+		}
+
+		//! The suggested text (including the extra character, if any)
+		string text;
+		//! The kind of suggestion: keyword, catalog, schema, table, table_function, column, scalar_function,
+		//! file_name or directory (the names the shell understands)
+		string type;
+		//! Distance from the best fuzzy match: 0 for the best match(es), lower is better. Equal scores are
+		//! treated as ties by the shell, which then lists the candidates instead of accepting the first one
+		uint64_t score;
+		//! The character that ends the suggestion (e.g. a space after a keyword, '.' after a schema, a quote after
+		//! a file name), or '\0' if there is none
+		char extra_char;
+	};
+
 	struct SQLFuzzyCompleteFunctionData : public TableFunctionData
 	{
-		explicit SQLFuzzyCompleteFunctionData(vector<string> suggestions_p, idx_t start_pos)
+		explicit SQLFuzzyCompleteFunctionData(vector<FuzzyCompleteSuggestion> suggestions_p, idx_t start_pos)
 				: suggestions(std::move(suggestions_p)), start_pos(start_pos)
 		{
 		}
 
-		vector<string> suggestions;
+		vector<FuzzyCompleteSuggestion> suggestions;
 		idx_t start_pos;
 	};
 
@@ -44,49 +66,65 @@ namespace duckdb
 		idx_t offset;
 	};
 
+	static constexpr const char *SUGGESTION_KEYWORD = "keyword";
+	static constexpr const char *SUGGESTION_CATALOG = "catalog";
+	static constexpr const char *SUGGESTION_SCHEMA = "schema";
+	static constexpr const char *SUGGESTION_TABLE = "table";
+	static constexpr const char *SUGGESTION_TABLE_FUNCTION = "table_function";
+	static constexpr const char *SUGGESTION_COLUMN = "column";
+	static constexpr const char *SUGGESTION_SCALAR_FUNCTION = "scalar_function";
+	static constexpr const char *SUGGESTION_FILE_NAME = "file_name";
+	static constexpr const char *SUGGESTION_DIRECTORY = "directory";
+
 	struct FuzzyCompleteCandidate
 	{
-		explicit FuzzyCompleteCandidate(string candidate_p, int32_t score_bonus = 0)
-				: candidate(std::move(candidate_p)), score_bonus(score_bonus)
+		FuzzyCompleteCandidate(string candidate_p, const char *type_p, int32_t score_bonus = 0, char extra_char = '\0')
+				: candidate(std::move(candidate_p)), type(type_p), score_bonus(score_bonus), extra_char(extra_char)
 		{
 		}
 
 		string candidate;
+		//! The kind of suggestion (one of the SUGGESTION_* names)
+		const char *type;
 		//! The higher the score bonus, the more likely this candidate will be chosen
 		int32_t score_bonus;
+		//! The trailing character of the candidate text, if it has one
+		char extra_char;
 	};
 
-	static vector<string> ComputeSuggestions(vector<FuzzyCompleteCandidate> available_suggestions, const string &prefix,
-																					 const unordered_set<string> &extra_keywords, bool add_quotes = false)
+	static constexpr idx_t DEFAULT_MAX_SUGGESTIONS = 20;
+
+	static vector<FuzzyCompleteSuggestion> ComputeSuggestions(vector<FuzzyCompleteCandidate> available_suggestions,
+																														const string &prefix,
+																														const unordered_set<string> &extra_keywords,
+																														idx_t max_results, bool add_quotes = false)
 	{
 		for (auto &kw : extra_keywords)
 		{
-			available_suggestions.emplace_back(std::move(kw));
+			available_suggestions.emplace_back(kw, SUGGESTION_KEYWORD);
 		}
 
-		const size_t max_results = 20;
-
-		// Create a vector of const char* pointers
+		// Make sure all of the suggestions are unique (the first candidate with a given text wins), and remember
+		// which candidate each pointer handed to the matcher belongs to.
 		std::vector<const char *> candidate_pool_pointers;
-		std::vector<const char *> suggestion_results(max_results);
-
-		// Make sure all of the suggestions are unique.
-
-		std::set<shared_ptr<std::string>> unique_suggestions;
-		for (const auto &str : available_suggestions)
+		candidate_pool_pointers.reserve(available_suggestions.size());
+		unordered_set<string> seen;
+		unordered_map<const char *, idx_t> pointer_to_candidate;
+		for (idx_t i = 0; i < available_suggestions.size(); i++)
 		{
-			unique_suggestions.insert(make_shared_ptr<string>(str.candidate));
-		}
-
-		candidate_pool_pointers.reserve(unique_suggestions.size());
-
-		for (const auto &str : unique_suggestions)
-		{
-			candidate_pool_pointers.push_back(str->c_str());
+			auto &candidate = available_suggestions[i].candidate;
+			if (!seen.insert(candidate).second)
+			{
+				continue;
+			}
+			candidate_pool_pointers.push_back(candidate.c_str());
+			pointer_to_candidate[candidate.c_str()] = i;
 		}
 
 		// Get the suggestions from rust
-		size_t actual_matches;
+		std::vector<const char *> suggestion_results(max_results);
+		std::vector<uint64_t> suggestion_scores(max_results);
+		size_t actual_matches = 0;
 
 		perform_matches(
 				candidate_pool_pointers.data(),
@@ -95,28 +133,38 @@ namespace duckdb
 				prefix.size(),
 				max_results,
 				suggestion_results.data(),
+				suggestion_scores.data(),
 				&actual_matches);
 
-		vector<string> results;
+		vector<FuzzyCompleteSuggestion> results;
 		results.reserve(actual_matches);
 		for (size_t i = 0; i < actual_matches; i++)
 		{
-			results.emplace_back(string(suggestion_results[i]));
-		}
-
-		if (add_quotes)
-		{
-			for (auto &result : results)
+			auto entry = pointer_to_candidate.find(suggestion_results[i]);
+			if (entry == pointer_to_candidate.end())
 			{
-				if (extra_keywords.find(result) == extra_keywords.end())
+				throw InternalException("fuzzycomplete: matcher returned an unknown candidate");
+			}
+			auto &candidate = available_suggestions[entry->second];
+			// The matcher ranks the best match first; report the distance from it so that, like the stock
+			// autocomplete extension, lower scores are better and equal scores are ties.
+			uint64_t score = suggestion_scores[0] >= suggestion_scores[i] ? suggestion_scores[0] - suggestion_scores[i] : 0;
+			string text = candidate.candidate;
+			char extra_char = candidate.extra_char;
+
+			if (add_quotes)
+			{
+				if (extra_keywords.find(text) == extra_keywords.end())
 				{
-					result = KeywordHelper::WriteOptionallyQuoted(result, '"', true);
+					text = KeywordHelper::WriteOptionallyQuoted(text, '"', true);
 				}
 				else
 				{
-					result = result + " ";
+					text = text + " ";
+					extra_char = ' ';
 				}
 			}
+			results.emplace_back(std::move(text), candidate.type, score, extra_char);
 		}
 		return results;
 	}
@@ -144,7 +192,7 @@ namespace duckdb
 			{
 				score = 1;
 			}
-			result.emplace_back(kw + " ", score);
+			result.emplace_back(kw + " ", SUGGESTION_KEYWORD, score, ' ');
 		}
 		return result;
 	}
@@ -213,6 +261,7 @@ namespace duckdb
 			auto &entry = entry_ref.get();
 			// prioritize user-defined entries (views & tables)
 			int32_t bonus = (entry.internal || entry.type == CatalogType::TABLE_FUNCTION_ENTRY) ? 0 : 1;
+			auto type = entry.type == CatalogType::TABLE_FUNCTION_ENTRY ? SUGGESTION_TABLE_FUNCTION : SUGGESTION_TABLE;
 
 			// We should use the full path based on the calling context of the user.
 			auto catalog_name = entry_ref.get().ParentCatalog().GetName().GetIdentifierName();
@@ -228,17 +277,17 @@ namespace duckdb
 			{
 				seen_databases.insert(quoted_catalog_name);
 				seen_schemas.insert(prefix);
-				suggestions.emplace_back(prefix + "." + quoted_entry_name, bonus);
+				suggestions.emplace_back(prefix + "." + quoted_entry_name, type, bonus);
 			}
 			else
 			{
 				if (schema_name == default_schema)
 				{
-					suggestions.emplace_back(quoted_entry_name, bonus);
+					suggestions.emplace_back(quoted_entry_name, type, bonus);
 				}
 				else
 				{
-					suggestions.emplace_back(quoted_schema_name + "." + quoted_entry_name, bonus);
+					suggestions.emplace_back(quoted_schema_name + "." + quoted_entry_name, type, bonus);
 					seen_schemas.insert(prefix);
 				}
 			}
@@ -246,18 +295,12 @@ namespace duckdb
 
 		for (auto &database : seen_databases)
 		{
-			suggestions.emplace_back(database, 1);
+			suggestions.emplace_back(database + ".", SUGGESTION_CATALOG, 1, '.');
 		}
 
 		for (auto &schema : seen_schemas)
 		{
-			suggestions.emplace_back(schema, 1);
-		}
-
-		vector<string> suggestions_str;
-		for (auto &suggestion : suggestions)
-		{
-			suggestions_str.emplace_back(suggestion.candidate);
+			suggestions.emplace_back(schema + ".", SUGGESTION_SCHEMA, 1, '.');
 		}
 
 		return suggestions;
@@ -275,7 +318,7 @@ namespace duckdb
 				auto &table = entry.Cast<TableCatalogEntry>();
 				for (auto &col : table.GetColumns().Logical())
 				{
-					suggestions.emplace_back(col.GetName().GetIdentifierName(), 1);
+					suggestions.emplace_back(col.GetName().GetIdentifierName(), SUGGESTION_COLUMN, 1);
 				}
 			}
 			else if (entry.type == CatalogType::VIEW_ENTRY)
@@ -283,7 +326,7 @@ namespace duckdb
 				auto &view = entry.Cast<ViewCatalogEntry>();
 				for (auto &col : view.aliases)
 				{
-					suggestions.emplace_back(col.GetIdentifierName(), 1);
+					suggestions.emplace_back(col.GetIdentifierName(), SUGGESTION_COLUMN, 1);
 				}
 			}
 			else
@@ -292,7 +335,7 @@ namespace duckdb
 				{
 					continue;
 				}
-				suggestions.emplace_back(entry.name.GetIdentifierName());
+				suggestions.emplace_back(entry.name.GetIdentifierName(), SUGGESTION_SCALAR_FUNCTION);
 			};
 		}
 		return suggestions;
@@ -338,11 +381,13 @@ namespace duckdb
 		fs.ListFiles(search_dir, [&](const string &fname, bool is_dir)
 								 {
 		string suggestion;
+		char extra_char;
 		if (is_dir) {
-			suggestion = fname + fs.PathSeparator(fname);
+			extra_char = fs.PathSeparator(fname)[0];
 		} else {
-			suggestion = fname + "'";
+			extra_char = '\'';
 		}
+		suggestion = fname + extra_char;
 		int score = 0;
 		if (is_dir && fname[0] != '.') {
 			score = 2;
@@ -350,9 +395,17 @@ namespace duckdb
 		if (KnownExtension(fname)) {
 			score = 1;
 		}
-		result.emplace_back(std::move(suggestion), score); });
+		result.emplace_back(std::move(suggestion), is_dir ? SUGGESTION_DIRECTORY : SUGGESTION_FILE_NAME, score, extra_char); });
 		return result;
 	}
+
+	//! Optional named parameters of sql_auto_complete, accepted for compatibility with the stock autocomplete
+	//! extension (max_exact_suggestion_count is accepted but has no effect: fuzzy matching has no exact-only tail)
+	struct FuzzyCompleteParameters
+	{
+		idx_t max_suggestion_count = DEFAULT_MAX_SUGGESTIONS;
+		idx_t max_file_suggestion_count = DEFAULT_MAX_SUGGESTIONS;
+	};
 
 	enum class SuggestionState : uint8_t
 	{
@@ -367,7 +420,8 @@ namespace duckdb
 		return StringUtil::CharacterIsOperator(c) && c != '.';
 	}
 
-	static duckdb::unique_ptr<SQLFuzzyCompleteFunctionData> GenerateSuggestions(ClientContext &context, const string &sql)
+	static duckdb::unique_ptr<SQLFuzzyCompleteFunctionData> GenerateSuggestions(ClientContext &context, const string &sql,
+	                                                                             const FuzzyCompleteParameters &parameters)
 	{
 		// for auto-completion, we consider 4 scenarios
 		// * there is nothing in the buffer, or only one word -> suggest a keyword
@@ -446,7 +500,7 @@ namespace duckdb
 			}
 		}
 		// no suggestions inside comments
-		return make_uniq<SQLFuzzyCompleteFunctionData>(vector<string>(), 0);
+		return make_uniq<SQLFuzzyCompleteFunctionData>(vector<FuzzyCompleteSuggestion>(), 0);
 	in_quotes:
 		for (; pos < sql.size(); pos++)
 		{
@@ -518,23 +572,27 @@ namespace duckdb
 		}
 		auto last_word = sql.substr(last_pos, pos - last_pos);
 		last_pos -= pos_offset;
-		vector<string> suggestions;
+		vector<FuzzyCompleteSuggestion> suggestions;
 
 		switch (suggest_state)
 		{
 		case SuggestionState::SUGGEST_KEYWORD:
-			suggestions = ComputeSuggestions(SuggestKeyword(context), last_word, suggested_keywords);
+			suggestions = ComputeSuggestions(SuggestKeyword(context), last_word, suggested_keywords,
+			                                 parameters.max_suggestion_count);
 			break;
 		case SuggestionState::SUGGEST_TABLE_NAME:
-			suggestions = ComputeSuggestions(SuggestTableName(context), last_word, suggested_keywords, false);
+			suggestions = ComputeSuggestions(SuggestTableName(context), last_word, suggested_keywords,
+			                                 parameters.max_suggestion_count, false);
 			break;
 		case SuggestionState::SUGGEST_COLUMN_NAME:
-			suggestions = ComputeSuggestions(SuggestColumnName(context), last_word, suggested_keywords, true);
+			suggestions = ComputeSuggestions(SuggestColumnName(context), last_word, suggested_keywords,
+			                                 parameters.max_suggestion_count, true);
 			break;
 		case SuggestionState::SUGGEST_FILE_NAME:
 			last_pos = pos;
 			suggestions =
-					ComputeSuggestions(SuggestFileName(context, last_word, last_pos), last_word, unordered_set<string>());
+					ComputeSuggestions(SuggestFileName(context, last_word, last_pos), last_word, unordered_set<string>(),
+			                       parameters.max_file_suggestion_count);
 			break;
 		default:
 			throw InternalException("Unrecognized suggestion state");
@@ -559,13 +617,48 @@ namespace duckdb
 		{
 			throw BinderException("sql_auto_complete first parameter cannot be NULL");
 		}
+		FuzzyCompleteParameters parameters;
+		for (auto &param : input.named_parameters)
+		{
+			if (param.second.IsNull())
+			{
+				throw BinderException("sql_auto_complete %s cannot be NULL", param.first);
+			}
+			if (param.first == "max_suggestion_count")
+			{
+				parameters.max_suggestion_count = UBigIntValue::Get(param.second);
+			}
+			else if (param.first == "max_file_suggestion_count")
+			{
+				parameters.max_file_suggestion_count = UBigIntValue::Get(param.second);
+			}
+			else if (param.first == "max_exact_suggestion_count")
+			{
+				// accepted for compatibility with the stock autocomplete extension
+			}
+			else
+			{
+				throw InternalException("Unsupported parameter for SQL auto complete");
+			}
+		}
+
+		// Same output shape as the stock autocomplete extension, which the DuckDB shell relies on
 		names.emplace_back("suggestion");
 		return_types.emplace_back(LogicalType::VARCHAR);
 
 		names.emplace_back("suggestion_start");
 		return_types.emplace_back(LogicalType::INTEGER);
 
-		return GenerateSuggestions(context, StringValue::Get(input.inputs[0]));
+		names.emplace_back("suggestion_type");
+		return_types.emplace_back(LogicalType::VARCHAR);
+
+		names.emplace_back("suggestion_score");
+		return_types.emplace_back(LogicalType::UBIGINT);
+
+		names.emplace_back("extra_char");
+		return_types.emplace_back(LogicalType::VARCHAR);
+
+		return GenerateSuggestions(context, StringValue::Get(input.inputs[0]), parameters);
 	}
 
 	unique_ptr<GlobalTableFunctionState> SQLFuzzyCompleteInit(ClientContext &context, TableFunctionInitInput &input)
@@ -589,12 +682,21 @@ namespace duckdb
 		auto &suggestion = output.data[0];
 		// suggestion_start, INTEGER
 		auto &suggestion_start = output.data[1];
+		// suggestion_type, VARCHAR
+		auto &suggestion_type = output.data[2];
+		// suggestion_score, UBIGINT
+		auto &suggestion_score = output.data[3];
+		// extra_char, VARCHAR
+		auto &extra_char = output.data[4];
 		while (data.offset < bind_data.suggestions.size() && count < STANDARD_VECTOR_SIZE)
 		{
 			auto &entry = bind_data.suggestions[data.offset++];
 
-			suggestion.Append(Value(entry));
+			suggestion.Append(Value(entry.text));
 			suggestion_start.Append(Value::INTEGER(NumericCast<int32_t>(bind_data.start_pos)));
+			suggestion_type.Append(Value(entry.type));
+			suggestion_score.Append(Value::UBIGINT(entry.score));
+			extra_char.Append(entry.extra_char == '\0' ? Value() : Value(string(1, entry.extra_char)));
 
 			count++;
 		}
@@ -602,8 +704,14 @@ namespace duckdb
 
 	static void LoadInternal(ExtensionLoader &loader)
 	{
-		TableFunction auto_complete_fun("sql_auto_complete", {LogicalType::VARCHAR}, SQLFuzzyCompleteFunction,
-		                               SQLFuzzyCompleteBind, SQLFuzzyCompleteInit);
+		TableFunction auto_complete_fun("sql_auto_complete",
+		                                FunctionSignature().AddPositionalOnly("sql", LogicalType::VARCHAR),
+		                                SQLFuzzyCompleteFunction, SQLFuzzyCompleteBind, SQLFuzzyCompleteInit);
+		auto_complete_fun.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+			options.Add("max_suggestion_count", LogicalType::UBIGINT)
+			    .Add("max_file_suggestion_count", LogicalType::UBIGINT)
+			    .Add("max_exact_suggestion_count", LogicalType::UBIGINT);
+		});
 		CreateTableFunctionInfo info(std::move(auto_complete_fun));
 		// The CLI preloads autocomplete. Replace its provider so LOAD fuzzycomplete
 		// actually activates fuzzy matching, including when the function already exists.

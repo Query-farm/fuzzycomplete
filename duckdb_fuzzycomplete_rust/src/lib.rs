@@ -30,6 +30,9 @@ pub extern "C" fn perform_matches(
     // The output ranking of candidates (pointers from the candidate pool)
     ranked_candidates: *mut *const c_char,
 
+    // The fuzzy match score of each ranked candidate (higher is better), may be null.
+    ranked_scores: *mut u64,
+
     // The actual number of produced results.
     actual_results: *mut usize,
 ) {
@@ -67,6 +70,9 @@ pub extern "C" fn perform_matches(
         *actual_results = result_count;
         for (index, result) in match_results.iter().enumerate().take(result_count) {
             *ranked_candidates.add(index) = result.0 .1;
+            if !ranked_scores.is_null() {
+                *ranked_scores.add(index) = result.1 as u64;
+            }
         }
     }
 }
