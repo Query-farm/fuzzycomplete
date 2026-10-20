@@ -15,6 +15,7 @@
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 
 // Include the declarations of things from Rust.
 #include "rust.h"
@@ -601,15 +602,13 @@ namespace duckdb
 
 	static void LoadInternal(ExtensionLoader &loader)
 	{
-		// For now just only load if the autocomplete extension isn't loaded.
-		// there are plans to improve this in the future.
-		auto &db = loader.GetDatabaseInstance();
-		if (!db.ExtensionIsLoaded("autocomplete"))
-		{
-			TableFunction auto_complete_fun("sql_auto_complete", {LogicalType::VARCHAR}, SQLFuzzyCompleteFunction,
-																			SQLFuzzyCompleteBind, SQLFuzzyCompleteInit);
-			loader.RegisterFunction(auto_complete_fun);
-		}
+		TableFunction auto_complete_fun("sql_auto_complete", {LogicalType::VARCHAR}, SQLFuzzyCompleteFunction,
+		                               SQLFuzzyCompleteBind, SQLFuzzyCompleteInit);
+		CreateTableFunctionInfo info(std::move(auto_complete_fun));
+		// The CLI preloads autocomplete. Replace its provider so LOAD fuzzycomplete
+		// actually activates fuzzy matching, including when the function already exists.
+		info.on_conflict = OnCreateConflict::REPLACE_ON_CONFLICT;
+		loader.RegisterFunction(std::move(info));
 
 		QueryFarmSendTelemetry(loader, "fuzzycomplete", "2026072501");
 	}
