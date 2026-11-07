@@ -1,0 +1,20 @@
+# name: test/sql/fuzzycomplete_non_utf8_filename.test
+# description: file name completion survives file names that are not valid UTF-8
+# group: [fuzzycomplete]
+
+# SQL strings cannot name such a file, so the directory is prepared outside the test (e.g. on Linux:
+#   d=$(mktemp -d); touch "$d/$(printf 'bad_\xff_name.csv')" "$d/good_name.csv"; export FUZZYCOMPLETE_NON_UTF8_DIR=$d)
+require-env FUZZYCOMPLETE_NON_UTF8_DIR
+
+require fuzzycomplete
+
+query T
+SELECT suggestion FROM sql_auto_complete('SELECT * FROM ''{FUZZYCOMPLETE_NON_UTF8_DIR}/good_nam') LIMIT 1;
+----
+good_name.csv'
+
+# The non-UTF-8 name cannot be written in SQL, so it is skipped instead of aborting the process
+query I
+SELECT count(*) FROM sql_auto_complete('SELECT * FROM ''{FUZZYCOMPLETE_NON_UTF8_DIR}/bad_') WHERE suggestion LIKE 'bad%';
+----
+0

@@ -1,0 +1,153 @@
+# name: test/sql/fuzzycomplete_robustness.test
+# description: sql_auto_complete edge cases: NULL input, comments, huge limits, file names, ranking
+# group: [fuzzycomplete]
+
+require fuzzycomplete
+
+# NULL input is an error, not a crash
+statement error
+SELECT * FROM sql_auto_complete(NULL);
+----
+cannot be NULL
+
+statement error
+SELECT * FROM sql_auto_complete('SEL', max_suggestion_count := NULL);
+----
+cannot be NULL
+
+# Empty input suggests statement keywords, SELECT first
+query T
+SELECT trim(suggestion) FROM sql_auto_complete('') LIMIT 1;
+----
+SELECT
+
+# A huge max_suggestion_count must not allocate a result slot per requested suggestion
+query I
+SELECT count(*) > 0 FROM sql_auto_complete('S', max_suggestion_count := 18446744073709551615);
+----
+true
+
+query I
+SELECT count(*) > 0 FROM sql_auto_complete('SELECT * FROM ''t', max_file_suggestion_count := 18446744073709551615);
+----
+true
+
+query I
+SELECT count(*) FROM sql_auto_complete('SEL', max_suggestion_count := 0);
+----
+0
+
+# Among equally good fuzzy matches the most common statements come first
+query T
+SELECT trim(suggestion) FROM sql_auto_complete('D') LIMIT 1;
+----
+DELETE
+
+# No suggestions inside comments
+query I
+SELECT count(*) FROM sql_auto_complete('SELECT 1 -- a comment SEL');
+----
+0
+
+query I
+SELECT count(*) FROM sql_auto_complete('SELECT 1 /* an unterminated comment SEL');
+----
+0
+
+statement ok
+CREATE TABLE customer_order_history (order_total INTEGER, order_id INTEGER);
+
+statement ok
+CREATE TABLE store_inventory (order_quantity INTEGER);
+
+# Block comments are skipped like whitespace
+query TI
+SELECT suggestion, suggestion_start FROM sql_auto_complete('SELECT * /* tables: */ FROM cstmr_ord') LIMIT 1;
+----
+customer_order_history	28
+
+query TI
+SELECT suggestion, suggestion_start FROM sql_auto_complete('SELECT * FROM/* x */cstmr_ord') LIMIT 1;
+----
+customer_order_history	20
+
+# A keyword followed directly by a block comment still selects the table-name state
+query T
+SELECT suggestion_type FROM sql_auto_complete('SELECT * FROM/**/cstmr') LIMIT 1;
+----
+table
+
+# Line comments end at the newline
+query TI
+SELECT suggestion, suggestion_start FROM sql_auto_complete('SELECT * -- tables
+FROM cstmr_ord') LIMIT 1;
+----
+customer_order_history	24
+
+# User tables rank before built-in tables and table functions
+query TT rowsort
+SELECT suggestion, suggestion_type FROM sql_auto_complete('SELECT * FROM ') LIMIT 2;
+----
+customer_order_history	table
+store_inventory	table
+
+# Columns of the tables named in the query rank first
+query T
+SELECT suggestion FROM sql_auto_complete('SELECT * FROM store_inventory WHERE ordr') LIMIT 1;
+----
+order_quantity
+
+query T
+SELECT suggestion FROM sql_auto_complete('SELECT * FROM customer_order_history WHERE ordr') LIMIT 1;
+----
+order_id
+
+# Macros are offered: scalar macros as functions, table macros as table functions
+statement ok
+CREATE MACRO add_one_hundred(x) AS x + 100;
+
+statement ok
+CREATE MACRO recent_orders_view() AS TABLE SELECT * FROM customer_order_history;
+
+query TT
+SELECT suggestion, suggestion_type FROM sql_auto_complete('SELECT add_on_hund') LIMIT 1;
+----
+add_one_hundred	scalar_function
+
+query TT
+SELECT suggestion, suggestion_type FROM sql_auto_complete('SELECT * FROM rcnt_ordrs') LIMIT 1;
+----
+recent_orders_view	table_function
+
+# Unicode identifiers
+statement ok
+CREATE TABLE "café_menü" (prïce INTEGER);
+
+query T
+SELECT suggestion FROM sql_auto_complete('SELECT * FROM cafmen') LIMIT 1;
+----
+"café_menü"
+
+# File name completion inside a string literal
+statement ok
+COPY (SELECT 1 AS x) TO '__TEST_DIR__/fz_alpha_report.csv';
+
+query TTT
+SELECT suggestion, suggestion_type, extra_char FROM sql_auto_complete('SELECT * FROM ''__TEST_DIR__/fz_alph_rprt') LIMIT 1;
+----
+fz_alpha_report.csv'	file_name	'
+
+# File name completion lists directories, so it respects the external access sandbox
+statement ok
+SET enable_external_access = false;
+
+statement error
+SELECT * FROM sql_auto_complete('SELECT * FROM ''test/sq');
+----
+file system operations are disabled by configuration
+
+# Everything else still completes
+query T
+SELECT suggestion FROM sql_auto_complete('SELECT * FROM cstmr_ord') LIMIT 1;
+----
+customer_order_history
